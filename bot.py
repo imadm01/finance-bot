@@ -33,9 +33,28 @@ from parser import parse_message
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Responds 200 OK to any GET/HEAD — that's all Render and UptimeRobot need
+    to consider the service 'up'. We're not serving anything real here."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # stops the request-logging spam you saw in the deploy logs
+
+
 def run_health_server():
     port = int(os.getenv("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), BaseHTTPRequestHandler).serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
+
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
