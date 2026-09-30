@@ -31,17 +31,13 @@ import chart_style
 from parser import parse_message
 
 import threading
-from flask import Flask
-
-health_app = Flask(__name__)
-
-@health_app.route("/")
-def health():
-    return "Finance Bot is running!", 200
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    health_app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), BaseHTTPRequestHandler).serve_forever()
+
+threading.Thread(target=run_health_server, daemon=True).start()
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -775,13 +771,29 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # BACKGROUND JOBS: daily reminder + weekly digest
 # ============================================================
 
+sent_reminders_today = set()  # (user_id, date) pairs we've already nagged today — avoids double-sends
+
 async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every minute; pings anyone whose reminder time matches now and hasn't logged today."""
-    now_str = datetime.now().strftime("%H:%M")
+    """
+    Runs every minute. Fires for anyone whose reminder time has passed in the
+    last 10 minutes (not just an exact match) — covers brief gaps where
+    Render's free tier was asleep or mid-restart right at the target minute.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
     for user_id, reminder_time in db.all_users_with_reminders():
-        if reminder_time == now_str and not db.has_entries_today(user_id):
+        key = (user_id, today)
+        if key in sent_reminders_today:
+            continue
+        try:
+            hh, mm = map(int, reminder_time.split(":"))
+            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except ValueError:
+            continue
+        if target <= now <= target + timedelta(minutes=10) and not db.has_entries_today(user_id):
             try:
                 await context.bot.send_message(user_id, "Don't forget to log today's spending!")
+                sent_reminders_today.add(key)
             except Exception:
                 pass  # user may have blocked the bot — safe to ignore
 
@@ -844,7 +856,5 @@ app.job_queue.run_repeating(daily_reminder_job, interval=60, first=10)
 app.job_queue.run_daily(weekly_digest_job, time=dtime(hour=18, minute=0), days=(6,))  # Sunday
 
 print("Bot is running...")
-
-threading.Thread(target=run_health_server, daemon=True).start()
 
 app.run_polling()
