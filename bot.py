@@ -94,10 +94,14 @@ class FauxUpdate:
 async def begin_onboarding(update, user_id):
     db.ensure_settings_row(user_id)
     conv_state[user_id] = {"flow": "onboarding", "step": "salary"}
-    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="onb:skip_salary")]])
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Last working day", callback_data="onb:lwd_salary"),
+        InlineKeyboardButton("Skip", callback_data="onb:skip_salary"),
+    ]])
     await update.message.reply_text(
         "Welcome! A couple of quick questions to set things up (all optional).\n\n"
-        "1) What day does your salary usually come in? (1-31)",
+        "1) What day does your salary usually come in? Send a number (1-31), "
+        "or tap 'Last working day' if it varies by month.",
         reply_markup=buttons,
     )
 
@@ -467,6 +471,9 @@ async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         sub = parts[1]
         if sub == "skip_salary":
+            await ask_recurring_yn(query, user_id, state)
+        elif sub == "lwd_salary":
+            db.update_settings(user_id, salary_day=db.LWD_SENTINEL)
             await ask_recurring_yn(query, user_id, state)
         elif sub == "recurring_yes":
             state["step"] = "recurring_entry"
@@ -860,6 +867,22 @@ async def reminder_off_cmd(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Daily reminder turned off.")
 
 
+async def set_salary_cmd(update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /setsalary 5   or   /setsalary last")
+        return
+    arg = context.args[0].lower()
+    user_id = update.effective_user.id
+    if arg in ("last", "lwd"):
+        db.update_settings(user_id, salary_day=db.LWD_SENTINEL)
+        await update.message.reply_text("Salary day set to: last working day of the month.")
+    elif arg.isdigit() and 1 <= int(arg) <= 31:
+        db.update_settings(user_id, salary_day=int(arg))
+        await update.message.reply_text(f"Salary day set to day {arg}.")
+    else:
+        await update.message.reply_text("Usage: /setsalary 5   or   /setsalary last")
+
+
 async def addrecurring_cmd(update, context: ContextTypes.DEFAULT_TYPE):
     conv_state[update.effective_user.id] = {"flow": "recurring"}
     await update.message.reply_text("Send it as: Label Day  (e.g. Gym 5)")
@@ -870,8 +893,13 @@ async def settings_cmd(update, context: ContextTypes.DEFAULT_TYPE):
     settings = db.get_settings(user_id)
     recurring = db.get_recurring(user_id)
 
+    salary_display = "not set"
+    if settings and settings["salary_day"] is not None:
+        salary_display = ("last working day of month" if settings["salary_day"] == db.LWD_SENTINEL
+                           else settings["salary_day"])
+
     lines = ["Your Settings", ""]
-    lines.append(f"Salary day: {settings['salary_day'] if settings and settings['salary_day'] else 'not set'}")
+    lines.append(f"Salary day: {salary_display}")
     lines.append(f"Daily reminder: {settings['reminder_time'] if settings and settings['reminder_time'] else 'off'}")
     if recurring:
         lines.append("")
@@ -879,7 +907,7 @@ async def settings_cmd(update, context: ContextTypes.DEFAULT_TYPE):
         for _, label, day in recurring:
             lines.append(f"  {label} — day {day}")
     lines.append("")
-    lines.append("Change with /setreminder HH:MM or /addrecurring")
+    lines.append("Change with /setsalary, /setreminder HH:MM, or /addrecurring")
     lines.append("Delete data with /delete, /deletegoal, or /resetall")
     await update.message.reply_text("\n".join(lines))
 
@@ -978,6 +1006,7 @@ app.add_handler(CommandHandler("find", find_cmd))
 app.add_handler(CommandHandler("export", export_cmd))
 app.add_handler(CommandHandler("chart", chart_cmd))
 app.add_handler(CommandHandler("trend", trend_cmd))
+app.add_handler(CommandHandler("setsalary", set_salary_cmd))
 app.add_handler(CommandHandler("setreminder", set_reminder_cmd))
 app.add_handler(CommandHandler("reminder", reminder_off_cmd))  # /reminder off (only "off" is supported)
 app.add_handler(CommandHandler("addrecurring", addrecurring_cmd))
