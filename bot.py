@@ -1,21 +1,24 @@
 """
 bot.py — the Telegram side of the finance bot.
-db.py handles data, chart_style.py handles chart looks, parser.py reads messages.
+db.py handles data (MongoDB Atlas), chart_style.py handles chart looks, parser.py reads messages.
 This file wires them all together into commands and button taps.
 
 COMMANDS:
   /start /help /menu
   /today /month /networth
   /setbudget /budgets /suggest
-  /goals /newgoal /category
+  /goals /newgoal /deletegoal /category
   /find /export
   /chart /trend
   /setreminder /reminder off /addrecurring /settings
+  /delete (transactions by range) /resetall (wipes everything, restarts onboarding)
 """
 
 import os
 import io
 import csv
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
 
@@ -30,14 +33,15 @@ import db
 import chart_style
 from parser import parse_message
 
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
+# ============================================================
+# TINY HEALTH-CHECK SERVER
+# Render's free tier only keeps "Web Services" alive, and a web service
+# must answer HTTP requests on a port. This doesn't serve anything real —
+# it just says "200 OK" so Render (and UptimeRobot, keeping it awake)
+# both see the service as healthy. The actual bot runs in the main thread.
+# ============================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Responds 200 OK to any GET/HEAD — that's all Render and UptimeRobot need
-    to consider the service 'up'. We're not serving anything real here."""
-
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
@@ -48,7 +52,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        pass  # stops the request-logging spam you saw in the deploy logs
+        pass  # keeps request logging out of the deploy logs
 
 
 def run_health_server():
@@ -65,9 +69,10 @@ CATEGORIES = ["Food", "Travel", "Savings", "Parents", "Bills", "Shopping", "Ente
 PAGE_SIZE = 10
 
 # ---- in-memory state (resets if the bot restarts — that's fine, these are short-lived) ----
-pending = {}          # user_id -> transaction dict, waiting for a category button tap
-pending_savings = {}  # user_id -> transaction dict, waiting for a goal button tap
-conv_state = {}       # user_id -> {"flow": ..., "step": ..., ...} for multi-step text flows
+pending = {}               # user_id -> transaction dict, waiting for a category button tap
+pending_savings = {}       # user_id -> transaction dict, waiting for a goal button tap
+conv_state = {}            # user_id -> {"flow": ..., "step": ..., ...} for multi-step text flows
+sent_reminders_today = set()  # (user_id, date) pairs already nagged today — avoids double-sends
 
 
 class FauxUpdate:
@@ -82,10 +87,11 @@ class FauxUpdate:
 
 
 # ============================================================
-# ONBOARDING (runs once per new user, on their first /start)
+# ONBOARDING (runs once per new user, on their first /start —
+# and again after /resetall, since that deletes their settings row)
 # ============================================================
 
-async def begin_onboarding(update: Update, user_id):
+async def begin_onboarding(update, user_id):
     db.ensure_settings_row(user_id)
     conv_state[user_id] = {"flow": "onboarding", "step": "salary"}
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="onb:skip_salary")]])
@@ -168,7 +174,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  500 savings  (opens goal picker)\n\n"
         "Everything else: /menu\n\n"
         "All commands: /today /month /networth /budgets /suggest "
-        "/goals /category /find /export /chart /trend /settings"
+        "/goals /deletegoal /category /find /export /chart /trend /settings "
+        "/delete /resetall"
     )
 
 
@@ -371,6 +378,48 @@ async def category_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# DELETING DATA: /delete (transactions)  /deletegoal  /resetall (everything)
+# ============================================================
+
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Today", callback_data="del:today"),
+         InlineKeyboardButton("This Week", callback_data="del:week")],
+        [InlineKeyboardButton("This Month", callback_data="del:month"),
+         InlineKeyboardButton("Everything", callback_data="del:all")],
+    ])
+    await update.message.reply_text(
+        "What would you like to delete? This only removes transactions "
+        "(your budgets, goals, and settings stay as they are). This can't be undone.",
+        reply_markup=buttons,
+    )
+
+
+async def deletegoal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    goals_list = db.get_goals(user_id)
+    if not goals_list:
+        await update.message.reply_text("You don't have any goals to delete.")
+        return
+    buttons = [[InlineKeyboardButton(name, callback_data=f"delgoal:{goal_id}")]
+               for goal_id, name, target, target_date in goals_list]
+    await update.message.reply_text("Which goal do you want to delete?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def resetall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Yes, erase everything", callback_data="reset:confirm"),
+        InlineKeyboardButton("Cancel", callback_data="reset:cancel"),
+    ]])
+    await update.message.reply_text(
+        "This erases EVERYTHING — every transaction, budget, goal, and setting — "
+        "and starts you over like a brand new user. This cannot be undone.\n\n"
+        "Are you sure?",
+        reply_markup=buttons,
+    )
+
+
+# ============================================================
 # BUTTON TAPS (one router for every inline button in the bot)
 # ============================================================
 
@@ -442,6 +491,72 @@ async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handler = handler_map.get(target)
         if handler:
             await handler(faux, context)
+
+    elif action == "del":
+        range_key = parts[1]
+        labels = {"today": "today's entries", "week": "this week's entries",
+                  "month": "this month's entries", "all": "ALL your entries, ever"}
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Yes, delete", callback_data=f"delconfirm:{range_key}"),
+            InlineKeyboardButton("Cancel", callback_data="delcancel"),
+        ]])
+        await query.edit_message_text(
+            f"Delete {labels[range_key]}? This can't be undone.",
+            reply_markup=buttons,
+        )
+
+    elif action == "delconfirm":
+        range_key = parts[1]
+        if range_key == "all":
+            count = db.delete_all_transactions(user_id)
+        else:
+            if range_key == "today":
+                start = datetime.now().strftime("%Y-%m-%d") + " 00:00:00"
+                end = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d") + " 00:00:00"
+            elif range_key == "week":
+                start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d") + " 00:00:00"
+                end = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d") + " 00:00:00"
+            else:  # month
+                settings = db.get_settings(user_id)
+                salary_day = settings["salary_day"] if settings else None
+                start, end = db.cycle_bounds(salary_day)
+            count = db.delete_transactions_between(user_id, start, end)
+        await query.edit_message_text(f"Deleted {count} entr{'y' if count == 1 else 'ies'}.")
+
+    elif action == "delcancel":
+        await query.edit_message_text("Cancelled — nothing was deleted.")
+
+    elif action == "delgoal":
+        goal_id = int(parts[1])
+        goal = db.get_goal_by_id(goal_id)
+        if goal is None or goal[1] != user_id:
+            await query.edit_message_text("Couldn't find that goal.")
+            return
+        saved = db.goal_progress(goal_id)
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Yes, delete", callback_data=f"delgoalconfirm:{goal_id}"),
+            InlineKeyboardButton("Cancel", callback_data="delcancel"),
+        ]])
+        extra = (f" It has ₹{saved:,.0f} saved — deleting it also removes those contribution entries."
+                 if saved else "")
+        await query.edit_message_text(f"Delete goal '{goal[2]}'?{extra}", reply_markup=buttons)
+
+    elif action == "delgoalconfirm":
+        goal_id = int(parts[1])
+        db.delete_goal(user_id, goal_id)
+        await query.edit_message_text("Goal deleted.")
+
+    elif action == "reset":
+        sub = parts[1]
+        if sub == "confirm":
+            db.delete_everything(user_id)
+            conv_state.pop(user_id, None)
+            pending.pop(user_id, None)
+            pending_savings.pop(user_id, None)
+            await query.edit_message_text("Everything has been erased. Let's set you up again.")
+            await begin_onboarding(query, user_id)  # query.message works the same way update.message does
+        else:
+            await query.edit_message_text("Cancelled — nothing was erased.")
 
 
 # ============================================================
@@ -765,6 +880,7 @@ async def settings_cmd(update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {label} — day {day}")
     lines.append("")
     lines.append("Change with /setreminder HH:MM or /addrecurring")
+    lines.append("Delete data with /delete, /deletegoal, or /resetall")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -790,12 +906,10 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # BACKGROUND JOBS: daily reminder + weekly digest
 # ============================================================
 
-sent_reminders_today = set()  # (user_id, date) pairs we've already nagged today — avoids double-sends
-
 async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every minute. Fires for anyone whose reminder time has passed in the
-    last 10 minutes (not just an exact match) — covers brief gaps where
+    last 10 minutes (not just an exact match) — this covers brief gaps where
     Render's free tier was asleep or mid-restart right at the target minute.
     """
     now = datetime.now()
@@ -858,6 +972,7 @@ app.add_handler(CommandHandler("budgets", budgets_cmd))
 app.add_handler(CommandHandler("suggest", suggest_cmd))
 app.add_handler(CommandHandler("goals", goals_cmd))
 app.add_handler(CommandHandler("newgoal", newgoal_cmd))
+app.add_handler(CommandHandler("deletegoal", deletegoal_cmd))
 app.add_handler(CommandHandler("category", category_cmd))
 app.add_handler(CommandHandler("find", find_cmd))
 app.add_handler(CommandHandler("export", export_cmd))
@@ -867,6 +982,8 @@ app.add_handler(CommandHandler("setreminder", set_reminder_cmd))
 app.add_handler(CommandHandler("reminder", reminder_off_cmd))  # /reminder off (only "off" is supported)
 app.add_handler(CommandHandler("addrecurring", addrecurring_cmd))
 app.add_handler(CommandHandler("settings", settings_cmd))
+app.add_handler(CommandHandler("delete", delete_cmd))
+app.add_handler(CommandHandler("resetall", resetall_cmd))
 
 app.add_handler(CallbackQueryHandler(button_tap))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_transaction))
@@ -875,5 +992,4 @@ app.job_queue.run_repeating(daily_reminder_job, interval=60, first=10)
 app.job_queue.run_daily(weekly_digest_job, time=dtime(hour=18, minute=0), days=(6,))  # Sunday
 
 print("Bot is running...")
-
 app.run_polling()

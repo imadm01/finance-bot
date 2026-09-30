@@ -526,3 +526,30 @@ def last_n_cycles(salary_day, n=3):
             - timedelta(days=1)
         ).date()
     return list(reversed(cycles))
+
+#deletes
+
+def delete_transactions_between(user_id, start, end):
+    result = transactions.delete_many({
+        "user_id": user_id,
+        "created_at": {"$gte": start, "$lt": end},
+    })
+    return result.deleted_count
+
+
+def delete_all_transactions(user_id):
+    result = transactions.delete_many({"user_id": user_id})
+    return result.deleted_count
+
+
+def delete_goal(user_id, goal_id):
+    goals.delete_one({"id": int(goal_id), "user_id": user_id})
+    transactions.delete_many({"goal_id": int(goal_id), "user_id": user_id})
+
+
+def delete_everything(user_id):
+    transactions.delete_many({"user_id": user_id})
+    budgets.delete_many({"user_id": user_id})
+    settings.delete_many({"user_id": user_id})
+    recurring_dates.delete_many({"user_id": user_id})
+    goals.delete_many({"user_id": user_id})
