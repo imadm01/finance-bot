@@ -1,13 +1,11 @@
 """
 db.py — everything related to talking to the MongoDB database.
 No Telegram code lives here; this file only knows about data.
-
-This version keeps the same public functions as the original SQLite db.py,
-so bot.py does not need to be rewritten.
 """
 
 import os
 import re
+import calendar
 from datetime import datetime, timedelta, date
 
 from dotenv import load_dotenv
@@ -32,6 +30,9 @@ settings = mongo_db["settings"]
 recurring_dates = mongo_db["recurring_dates"]
 goals = mongo_db["goals"]
 counters = mongo_db["_counters"]
+
+# salary_day value meaning "last working day of the month" instead of a fixed date
+LWD_SENTINEL = -1
 
 
 def init_db():
@@ -97,6 +98,19 @@ def delete_transaction(user_id, tx_id):
         "_id": int(tx_id),
         "user_id": user_id,
     })
+
+
+def delete_transactions_between(user_id, start, end):
+    result = transactions.delete_many({
+        "user_id": user_id,
+        "created_at": {"$gte": start, "$lt": end},
+    })
+    return result.deleted_count
+
+
+def delete_all_transactions(user_id):
+    result = transactions.delete_many({"user_id": user_id})
+    return result.deleted_count
 
 
 def sum_between(user_id, type_, start, end):
@@ -482,18 +496,60 @@ def goal_progress(goal_id):
     return row["total"] if row else 0
 
 
+def delete_goal(user_id, goal_id):
+    """Removes the goal and every contribution ever made toward it."""
+    goals.delete_one({"id": int(goal_id), "user_id": user_id})
+    transactions.delete_many({"goal_id": int(goal_id), "user_id": user_id})
+
+
+# ---------------- full account reset ----------------
+
+def delete_everything(user_id):
+    """Wipes every trace of this user. Deleting the settings row is what makes
+    them look 'brand new' again — /start checks for that row to decide
+    whether onboarding should run."""
+    transactions.delete_many({"user_id": user_id})
+    budgets.delete_many({"user_id": user_id})
+    settings.delete_many({"user_id": user_id})
+    recurring_dates.delete_many({"user_id": user_id})
+    goals.delete_many({"user_id": user_id})
+
+
 # ---------------- financial "month" cycle helpers ----------------
 # These let each person's "month" run from their salary day instead of the 1st.
+
+def last_working_day(year, month):
+    """
+    Last weekday (Mon-Fri) of the given month.
+    Note: this only skips weekends — there's no generic calendar for
+    company or public holidays, so it won't account for those.
+    """
+    last_day_num = calendar.monthrange(year, month)[1]
+    d = date(year, month, last_day_num)
+    while d.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        d -= timedelta(days=1)
+    return d
+
 
 def cycle_bounds(salary_day, ref_date=None):
     """
     Returns (start_str, end_str) for the financial cycle containing ref_date.
-    If salary_day is None, this is just the plain calendar month.
+    salary_day can be: None (plain calendar month), a day number 1-31,
+    or LWD_SENTINEL (last working day of each month).
     """
     ref = ref_date or date.today()
 
-    if not salary_day:
+    if salary_day is None:
         start = ref.replace(day=1)
+
+    elif salary_day == LWD_SENTINEL:
+        this_month_lwd = last_working_day(ref.year, ref.month)
+        if ref >= this_month_lwd:
+            start = this_month_lwd
+        else:
+            prev_month_end = ref.replace(day=1) - timedelta(days=1)
+            start = last_working_day(prev_month_end.year, prev_month_end.month)
+
     else:
         day = min(salary_day, 28)
         if ref.day >= day:
@@ -526,30 +582,3 @@ def last_n_cycles(salary_day, n=3):
             - timedelta(days=1)
         ).date()
     return list(reversed(cycles))
-
-#deletes
-
-def delete_transactions_between(user_id, start, end):
-    result = transactions.delete_many({
-        "user_id": user_id,
-        "created_at": {"$gte": start, "$lt": end},
-    })
-    return result.deleted_count
-
-
-def delete_all_transactions(user_id):
-    result = transactions.delete_many({"user_id": user_id})
-    return result.deleted_count
-
-
-def delete_goal(user_id, goal_id):
-    goals.delete_one({"id": int(goal_id), "user_id": user_id})
-    transactions.delete_many({"goal_id": int(goal_id), "user_id": user_id})
-
-
-def delete_everything(user_id):
-    transactions.delete_many({"user_id": user_id})
-    budgets.delete_many({"user_id": user_id})
-    settings.delete_many({"user_id": user_id})
-    recurring_dates.delete_many({"user_id": user_id})
-    goals.delete_many({"user_id": user_id})
